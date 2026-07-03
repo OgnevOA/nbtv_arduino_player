@@ -1,22 +1,24 @@
 # NBTV server: Telegram bot + encoder + pixel-stream, one container.
-# TrueNAS Scale: Apps -> Custom App -> "Install via YAML" and paste this.
-# Set the secrets in a .env file next to this compose (see .env.example),
-# or fill them into the environment block directly in the TrueNAS UI.
+# TrueNAS Scale: Apps -> Custom App -> "Install via YAML" and paste this,
+# then fill in the three x-marked values below (bot token, your user id, token).
 services:
   nbtv:
-    # Option A: pull the CI-built image from GHCR (after you push to GitHub).
-    image: ghcr.io/ognevoa/nbtv-server:latest
-    # Option B: build locally instead of pulling (comment out `image:` above).
-    # build: .
     container_name: nbtv
+    image: ghcr.io/ognevoa/nbtv-server:latest
+    pull_policy: always
     restart: unless-stopped
-    ports:
-      - "32125:32125"        # ESP32 hits http://<truenas-ip>:32125
     environment:
-      BOT_TOKEN: ${BOT_TOKEN}
-      ALLOWED_USER_ID: ${ALLOWED_USER_ID}
-      DEVICE_TOKEN: ${DEVICE_TOKEN}
-      DEFAULT_SPEED: "0.95"
-      DEFAULT_MAX_HEIGHT: "360"
+      # --- secrets: fill these in ---
+      BOT_TOKEN: xxx8857647:AAEUxxxxreplace-with-BotFather-token
+      ALLOWED_USER_ID: '432856xxx'          # your numeric Telegram id
+      DEVICE_TOKEN: nbtv-device-token-xxxx   # must match firmware secrets.h
+      # --- tuning / paths (defaults are fine) ---
+      HTTP_HOST: 0.0.0.0
+      HTTP_PORT: '32125'
+      CACHE_DIR: /data/cache
+      DEFAULT_SPEED: '0.95'
+      DEFAULT_MAX_HEIGHT: '360'
+    ports:
+      - '32125:32125'                        # ESP32 hits http://<truenas-ip>:32125
     volumes:
-      - ./data:/data         # encoded .nbtvf cache (persists across restarts)
+      - /mnt/Media/app/nbtv:/data            # adjust to your dataset path
