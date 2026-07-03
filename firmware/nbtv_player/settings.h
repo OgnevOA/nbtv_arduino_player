@@ -6,7 +6,7 @@
 struct Settings {
     String wifi_ssid;
     String wifi_pass;
-    String server_url;   // e.g. http://truenas.lan:8080
+    String server_url;   // e.g. http://truenas.lan:32125
     String token;        // shared X-Device-Token (optional)
     float  speed;        // disc-lock trim, default 0.95
     bool   invert;       // signal polarity for sync-positive kits

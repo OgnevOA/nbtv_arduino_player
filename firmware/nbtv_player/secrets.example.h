@@ -13,6 +13,6 @@
 
 #define NBTV_WIFI_SSID    "your-wifi-ssid"
 #define NBTV_WIFI_PASS    "your-wifi-password"
-#define NBTV_SERVER_URL   "http://truenas.lan:8080"
+#define NBTV_SERVER_URL   "http://truenas.lan:32125"
 #define NBTV_DEVICE_TOKEN ""            // must match the server's DEVICE_TOKEN
 #define NBTV_SPEED        0.95f         // default disc-lock speed (tunable later)

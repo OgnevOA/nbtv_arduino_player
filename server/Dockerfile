@@ -13,12 +13,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 
 ENV HTTP_HOST=0.0.0.0 \
-    HTTP_PORT=8080 \
+    HTTP_PORT=32125 \
     CACHE_DIR=/data/cache \
     DEFAULT_SPEED=0.95 \
     DEFAULT_MAX_HEIGHT=360
 
 VOLUME ["/data"]
-EXPOSE 8080
+EXPOSE 32125
 
 CMD ["python", "-m", "app"]

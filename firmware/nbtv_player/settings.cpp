@@ -81,7 +81,7 @@ static const char *FORM =
     "<form method=POST action=/save>"
     "WiFi SSID<input name=ssid>"
     "WiFi password<input name=pass type=password>"
-    "Server URL<input name=url placeholder='http://truenas.lan:8080'>"
+    "Server URL<input name=url placeholder='http://truenas.lan:32125'>"
     "Device token (optional)<input name=token>"
     "Speed<input name=speed value='0.95'>"
     "<button type=submit>Save &amp; reboot</button></form>";

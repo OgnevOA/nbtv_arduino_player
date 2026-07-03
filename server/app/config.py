@@ -24,7 +24,7 @@ class Settings:
     allowed_user_id: int = _int("ALLOWED_USER_ID", 0)
     device_token: str = os.environ.get("DEVICE_TOKEN", "")  # shared LAN token
     http_host: str = os.environ.get("HTTP_HOST", "0.0.0.0")
-    http_port: int = _int("HTTP_PORT", 8080)
+    http_port: int = _int("HTTP_PORT", 32125)
     cache_dir: Path = Path(os.environ.get("CACHE_DIR", "/data/cache"))
     default_speed: float = float(os.environ.get("DEFAULT_SPEED", "0.95"))
     default_max_height: int = _int("DEFAULT_MAX_HEIGHT", 360)

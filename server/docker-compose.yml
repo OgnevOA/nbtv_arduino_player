@@ -11,7 +11,7 @@ services:
     container_name: nbtv
     restart: unless-stopped
     ports:
-      - "8080:8080"          # ESP32 hits http://<truenas-ip>:8080
+      - "32125:32125"        # ESP32 hits http://<truenas-ip>:32125
     environment:
       BOT_TOKEN: ${BOT_TOKEN}
       ALLOWED_USER_ID: ${ALLOWED_USER_ID}
