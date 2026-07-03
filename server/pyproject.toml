@@ -1,0 +1,21 @@
+[project]
+name = "nbtv-server"
+version = "0.1.0"
+description = "Portable NBTV player server: Telegram bot + encoder + pixel-frame stream"
+requires-python = ">=3.11"
+dependencies = [
+    "aiogram>=3.13,<4",
+    "aiohttp>=3.10,<4",
+    "numpy>=1.26,<3",
+    "yt-dlp>=2024.10.7",
+]
+
+[project.scripts]
+nbtv-server = "app.server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["app"]

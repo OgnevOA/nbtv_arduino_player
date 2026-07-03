@@ -1,0 +1,25 @@
+# --- firmware credentials (never commit) ---
+firmware/nbtv_player/secrets.h
+
+# --- firmware build output ---
+firmware/build/
+firmware/.pio/
+
+# --- server ---
+server/data/
+**/*.nbtvf
+.env
+
+# --- python ---
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# --- os / editor ---
+.DS_Store
+*.swp
+
+# --- local-only assets not part of the player repo ---
+Disk/
+nbtv-tools-and-doc-V1-4/
