@@ -21,7 +21,9 @@ from .config import settings
 from .control import Hub, Program
 
 HELP = (
-    "Send a YouTube URL, a video, or a GIF to play it on the NBTV set.\n\n"
+    "Send a YouTube URL, a video, or a GIF to play it on the NBTV set.\n"
+    "Send a photo to display a still image.\n"
+    "Send a sticker (static, animated, or video) to play it.\n\n"
     "Use the buttons below, or:\n"
     "/menu - show the control buttons\n"
     "/stop - go idle (test card)\n"
@@ -60,18 +62,26 @@ def _allowed_cb(cb: CallbackQuery) -> bool:
     return bool(cb.from_user) and cb.from_user.id == settings.allowed_user_id
 
 
-async def _encode_program(source: str, title: str, *, loop: bool) -> Program:
-    """Encode (blocking) in a thread; reuse the .pcm cache when present."""
+async def _encode_program(source: str, title: str, *, loop: bool,
+                          kind: str = "clip") -> Program:
+    """Encode (blocking) in a thread; reuse the .pcm cache when present.
+
+    kind: "clip" (video), "still" (single image), "tgs" (animated sticker).
+    """
     opt = encoder.EncodeOptions(max_height=settings.default_max_height,
                                 headroom=settings.default_headroom,
                                 lowpass=settings.default_lowpass)
-    key = opt.cache_key(source)
+    key = opt.cache_key(f"{kind}:{source}")
     out = settings.cache_dir / f"{key}.pcm"
 
     def work() -> int:
         if out.exists():
             return out.stat().st_size // (nbtv.BYTES_PER_SAMPLE * nbtv.FRAME_SAMPLES)
         with tempfile.TemporaryDirectory(prefix="nbtv-") as td:
+            if kind == "still":
+                return encoder.encode_still_to_pcm(source, out, opt, Path(td))
+            if kind == "tgs":
+                return encoder.encode_tgs_to_pcm(source, out, opt, Path(td))
             return encoder.encode_to_pcm(source, out, opt, Path(td))
 
     frames = await asyncio.get_running_loop().run_in_executor(None, work)
@@ -148,20 +158,59 @@ def create_dispatcher(hub: Hub) -> tuple[Bot, Dispatcher]:
         hub.stop()  # idle streams the test card
         await message.answer("showing test card")
 
+    @dp.message(F.photo)
+    async def on_photo(message: Message):
+        if not _allowed(message):
+            return
+        await message.answer("downloading image...")
+        with tempfile.TemporaryDirectory(prefix="nbtv-img-") as td:
+            local = Path(td) / "input"
+            await bot.download(message.photo[-1], destination=local)
+            await message.answer("encoding...")
+            program = await _encode_program(str(local), "image", loop=True,
+                                            kind="still")
+        hub.play(program)
+        await message.answer("displaying image", reply_markup=_controls(hub))
+
+    @dp.message(F.sticker)
+    async def on_sticker(message: Message):
+        if not _allowed(message):
+            return
+        st = message.sticker
+        if st.is_video:
+            kind, ext, label = "clip", ".webm", "video sticker"
+        elif st.is_animated:
+            kind, ext, label = "tgs", ".tgs", "animated sticker"
+        else:
+            kind, ext, label = "still", ".webp", "sticker"
+        await message.answer(f"downloading {label}...")
+        with tempfile.TemporaryDirectory(prefix="nbtv-stk-") as td:
+            local = Path(td) / f"sticker{ext}"
+            await bot.download(st, destination=local)
+            await message.answer("encoding...")
+            program = await _encode_program(str(local), label, loop=True,
+                                            kind=kind)
+        hub.play(program)
+        await message.answer(f"playing {label}", reply_markup=_controls(hub))
+
     @dp.message(F.video | F.animation | F.document)
     async def on_media(message: Message):
         if not _allowed(message):
             return
         obj = message.video or message.animation or message.document
+        # An image sent as a file (document) is a still, not a clip.
+        is_image = bool(message.document and
+                        (message.document.mime_type or "").startswith("image/"))
         await message.answer("downloading...")
         with tempfile.TemporaryDirectory(prefix="nbtv-dl-") as td:
             local = Path(td) / "input"
             await bot.download(obj, destination=local)
             await message.answer("encoding...")
-            program = await _encode_program(str(local), "upload", loop=True)
+            program = await _encode_program(str(local), "upload", loop=True,
+                                            kind="still" if is_image else "clip")
         hub.play(program)
-        await message.answer(f"playing ({program.frames} frames)",
-                             reply_markup=_controls(hub))
+        msg = "displaying image" if is_image else f"playing ({program.frames} frames)"
+        await message.answer(msg, reply_markup=_controls(hub))
 
     @dp.message(F.text)
     async def on_text(message: Message):

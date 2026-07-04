@@ -115,22 +115,87 @@ def _grey_frames(src: Path, opt: EncodeOptions) -> np.ndarray:
     return buf[: n * per].reshape(n, rows, nbtv.COLS)
 
 
+def _resolve(source: str, workdir: Path, opt: EncodeOptions) -> Path:
+    if is_url(source):
+        return download(source, workdir, opt.max_height)
+    src = Path(source).expanduser().resolve()
+    if not src.exists():
+        _fail(f"file not found: {src}")
+    return src
+
+
+def _write_pcm(pcm: bytes, out_path: Path) -> None:
+    tmp = out_path.with_suffix(".pcm.tmp")
+    tmp.write_bytes(pcm)
+    tmp.replace(out_path)
+
+
 def encode_to_pcm(source: str, out_path: Path, opt: EncodeOptions,
                   workdir: Path) -> int:
     """Full pipeline: (download ->) decode -> synth -> .pcm. Returns frames."""
-    if is_url(source):
-        src = download(source, workdir, opt.max_height)
-    else:
-        src = Path(source).expanduser().resolve()
-        if not src.exists():
-            _fail(f"file not found: {src}")
-
+    src = _resolve(source, workdir, opt)
     frames = _grey_frames(src, opt)
     pcm = render.frames_to_pcm(frames, flip_h=opt.flip_h, flip_v=opt.flip_v,
                                stabilize=opt.stabilize, headroom=opt.headroom,
                                lowpass_hz=opt.lowpass)
-
-    tmp = out_path.with_suffix(".pcm.tmp")
-    tmp.write_bytes(pcm)
-    tmp.replace(out_path)
+    _write_pcm(pcm, out_path)
     return int(frames.shape[0])
+
+
+def _tgs_frames(src: Path, opt: EncodeOptions, workdir: Path) -> np.ndarray:
+    """Render a Telegram animated sticker (.tgs = gzipped Lottie) to grey frames.
+
+    rlottie renders the vector animation at native size/fps; we mux it to a temp
+    mp4 so the usual _grey_frames() crop/eq/fps-resample path applies unchanged.
+    """
+    try:
+        from rlottie_python import LottieAnimation
+    except ImportError:
+        _fail("rlottie-python not installed (needed for animated .tgs stickers)")
+
+    anim = LottieAnimation.from_tgs(str(src))
+    w, h = anim.lottie_animation_get_size()
+    fps = anim.lottie_animation_get_framerate() or nbtv.BASE_FPS
+    total = anim.lottie_animation_get_totalframe() or 1
+
+    mp4 = workdir / "tgs.mp4"
+    cmd = [_ffmpeg(), "-v", "error", "-y",
+           "-f", "rawvideo", "-pix_fmt", "rgba", "-s", f"{w}x{h}",
+           "-r", f"{fps}", "-i", "pipe:0",
+           "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(mp4)]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    assert proc.stdin is not None
+    for i in range(total):
+        img = anim.render_pillow_frame(frame_num=i)   # RGBA over black
+        proc.stdin.write(img.tobytes())
+    proc.stdin.close()
+    if proc.wait() != 0:
+        _fail("ffmpeg failed to assemble sticker frames")
+    return _grey_frames(mp4, opt)
+
+
+def encode_tgs_to_pcm(source: str, out_path: Path, opt: EncodeOptions,
+                      workdir: Path) -> int:
+    """Full pipeline for an animated (.tgs) sticker -> looping .pcm."""
+    src = _resolve(source, workdir, opt)
+    frames = _tgs_frames(src, opt, workdir)
+    pcm = render.frames_to_pcm(frames, flip_h=opt.flip_h, flip_v=opt.flip_v,
+                               stabilize=opt.stabilize, headroom=opt.headroom,
+                               lowpass_hz=opt.lowpass)
+    _write_pcm(pcm, out_path)
+    return int(frames.shape[0])
+
+
+def encode_still_to_pcm(source: str, out_path: Path, opt: EncodeOptions,
+                        workdir: Path, seconds: float = 2.0) -> int:
+    """Decode a still image and repeat it into a short loopable .pcm program."""
+    src = _resolve(source, workdir, opt)
+    frames = _grey_frames(src, opt)          # image -> 1 frame
+    n = max(1, int(round(seconds * nbtv.BASE_FPS)))
+    stack = np.repeat(frames[:1], n, axis=0)
+    # A still has no motion to stabilize; keep true picture levels.
+    pcm = render.frames_to_pcm(stack, flip_h=opt.flip_h, flip_v=opt.flip_v,
+                               stabilize=False, headroom=opt.headroom,
+                               lowpass_hz=opt.lowpass)
+    _write_pcm(pcm, out_path)
+    return n
