@@ -1,39 +1,51 @@
-"""Control hub: job model, command queue (long-poll), and device status.
+"""Control hub: the radio program, device command queue, and device status.
 
-Single-user, single-device. The bot pushes commands; the device long-polls for
-them and posts status back. Commands carry a monotonic sequence number so the
-device can ask for "anything newer than seq N".
+Single-user, single-device. The bot sets the current *program* (which PCM file
+the radio streams, or idle = test card). Program changes bump a monotonic token
+that the radio streamer watches so it can switch sources seamlessly.
+
+Device-local knobs that must track the physical disc (speed, invert, reboot)
+are still delivered as long-poll commands with a monotonic sequence number.
 """
 
 from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 
 @dataclass
-class Job:
-    id: str                      # cache key; device fetches /stream?id=<id>
-    title: str                   # human label for /status
-    frames: int
-    loop: bool = False
+class Program:
+    id: str                 # cache key
+    title: str              # human label for /status
+    pcm: Path               # path to the cached mono s16le PCM
+    frames: int = 0
+    loop: bool = True
 
 
 class Hub:
-    def __init__(self, *, history: int = 64, offline_after: float = 8.0):
+    def __init__(self, *, history: int = 64, offline_after: float = 8.0,
+                 default_speed: float = 0.95):
+        # device command channel (speed / invert / reboot)
         self._seq = 0
         self._commands: list[dict[str, Any]] = []
         self._history = history
         self._event = asyncio.Event()
-        self.current: Job | None = None
-        self.nxt: Job | None = None
+        self.speed = default_speed          # server-side intent (for keyboard +/-)
+        # radio program channel
+        self.program: Program | None = None      # None => idle (test card)
+        self.nxt: Program | None = None
+        self._ptoken = 0
+        self._pevent = asyncio.Event()
+        # device status
         self._status: dict[str, Any] = {}
         self._status_ts = 0.0
         self._offline_after = offline_after
 
-    # --- command production (bot side) ------------------------------------
+    # --- device commands (bot -> device) ----------------------------------
     def _push(self, **cmd: Any) -> int:
         self._seq += 1
         cmd["seq"] = self._seq
@@ -41,45 +53,25 @@ class Hub:
         if len(self._commands) > self._history:
             self._commands = self._commands[-self._history:]
         self._event.set()
-        self._event = asyncio.Event()  # wake current waiters, reset for next
+        self._event = asyncio.Event()
         return self._seq
 
-    def play(self, job: Job) -> int:
-        self.current = job
-        self.nxt = None
-        return self._push(cmd="play", id=job.id, loop=job.loop, title=job.title)
-
-    def enqueue_next(self, job: Job) -> int:
-        """Replace the 1-deep next slot (newest wins)."""
-        self.nxt = job
-        return self._push(cmd="preload", id=job.id)
-
-    def stop(self) -> int:
-        self.current = None
-        return self._push(cmd="stop")
-
-    def skip(self) -> int:
-        if self.nxt:
-            return self.play(self.nxt)
-        return self.stop()
-
-    def freeze(self) -> int:
-        return self._push(cmd="freeze")
-
-    def set_loop(self, loop: bool) -> int:
-        if self.current:
-            self.current.loop = loop
-        return self._push(cmd="loop", value=loop)
-
     def set_speed(self, value: float) -> int:
-        return self._push(cmd="speed", value=round(value, 4))
+        self.speed = round(max(0.80, min(1.20, value)), 4)
+        return self._push(cmd="speed", value=self.speed)
+
+    def adjust_speed(self, delta: float) -> float:
+        """Nudge speed by delta (for the keyboard +/- buttons). Returns new speed."""
+        self.set_speed(self.speed + delta)
+        return self.speed
+
+    def set_invert(self) -> int:
+        return self._push(cmd="invert")
 
     def reboot(self) -> int:
         return self._push(cmd="reboot")
 
-    # --- command consumption (device long-poll) ---------------------------
     async def poll(self, since: int, timeout: float = 25.0) -> dict[str, Any] | None:
-        """Return the first command with seq > since, waiting up to timeout."""
         deadline = time.monotonic() + timeout
         while True:
             for c in self._commands:
@@ -97,6 +89,55 @@ class Hub:
     def seq(self) -> int:
         return self._seq
 
+    # --- radio program (bot -> streamer) ----------------------------------
+    def _bump_program(self) -> int:
+        self._ptoken += 1
+        self._pevent.set()
+        self._pevent = asyncio.Event()
+        return self._ptoken
+
+    def play(self, program: Program) -> int:
+        self.program = program
+        self.nxt = None
+        return self._bump_program()
+
+    def enqueue_next(self, program: Program) -> None:
+        self.nxt = program
+
+    def stop(self) -> int:
+        self.program = None
+        return self._bump_program()
+
+    def skip(self) -> int:
+        if self.nxt:
+            p, self.nxt = self.nxt, None
+            return self.play(p)
+        return self.stop()
+
+    def set_loop(self, loop: bool) -> int:
+        if self.program:
+            self.program.loop = loop
+        return self._bump_program()
+
+    @property
+    def program_token(self) -> int:
+        return self._ptoken
+
+    def program_source(self) -> tuple[int, Path | None, bool]:
+        """(token, pcm path or None for idle/test-card, loop)."""
+        if self.program is None:
+            return self._ptoken, None, True
+        return self._ptoken, self.program.pcm, self.program.loop
+
+    async def wait_program(self, prev_token: int, timeout: float = 25.0) -> None:
+        """Return when the program token differs from prev_token (or timeout)."""
+        if prev_token != self._ptoken:
+            return
+        try:
+            await asyncio.wait_for(self._pevent.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
+
     # --- device status (device -> server) ---------------------------------
     def update_status(self, status: dict[str, Any]) -> None:
         self._status = status
@@ -107,14 +148,14 @@ class Hub:
         return (time.monotonic() - self._status_ts) < self._offline_after
 
     def status_text(self) -> str:
+        prog = self.program.title if self.program else "idle (test card)"
         if not self._status_ts:
-            return "device: never seen"
+            return f"program: {prog}\ndevice: never seen"
         s = self._status
         age = time.monotonic() - self._status_ts
         state = "online" if self.online else f"offline ({age:.0f}s)"
         parts = [f"device: {state}"]
-        for k in ("state", "id", "frame_seq", "buffer_ms", "underruns",
-                  "rssi", "speed"):
+        for k in ("state", "buffer_ms", "underruns", "rssi", "speed"):
             if k in s:
                 parts.append(f"{k}={s[k]}")
-        return "  ".join(parts)
+        return f"program: {prog}\n" + "  ".join(parts)

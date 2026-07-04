@@ -3,7 +3,7 @@
 A portable system to play YouTube clips, GIFs, and video files on a 1920s-style
 **32-line NBTVA mechanical (Nipkow-disc) television**, controlled from Telegram,
 encoded on TrueNAS Scale, and rendered to the disc by an **M5 Atom Lite (ESP32)**
-driving an **Atomic Audio-3.5 Base** (ES8311 DAC → 3.5 mm jack).
+driving an **Atomic Audio-3.5 Base** (ES8311 codec → 3.5 mm TRRS jack).
 
 This document is the authoritative plan. It supersedes prior chat discussion.
 
@@ -13,15 +13,16 @@ This document is the authoritative plan. It supersedes prior chat discussion.
 
 | # | Decision | Rationale |
 |---|---|---|
-| 1 | **8-bit grayscale** pixel transport | Simple; ~3 bits of headroom over NBTV's real luma depth. 4-bit is a future flag. |
-| 2 | **No audio** anywhere | The disc is silent picture only. Encoder drops all audio paths. |
-| 3 | **HTTP long-poll** control for v1 | Simplest firmware; no broker. WebSocket is a v2 upgrade. |
-| 4 | **Single Docker image**, built by **GitHub Actions** | Easiest to operate at home; one artifact to deploy on TrueNAS. |
+| 1 | **Radio architecture**: the server synthesizes the finished NBTV signal and streams it as audio | The `mtv.py` synthesis already produces a perfect signal on a PC; move it to the server and let the device be a thin player. Deletes all fragile on-device DSP. |
+| 2 | **Lossless mono 16-bit PCM @ 48 kHz** transport | Compression (MP3/AAC/Opus) smears the sharp sync pulses (ringing/pre-echo) and breaks sync. Lossless preserves the waveform exactly. |
+| 3 | **No audio** anywhere | The disc is silent picture only. The "audio" on the wire *is* the video signal. |
+| 4 | **Device keeps live: speed, gain, invert**; server bakes: levels, sync, stabilize, headroom, low-pass | The disc's physical speed drifts every session, so speed/level must be trimmable on the device without a re-encode. |
+| 5 | **HTTP long-poll** control + **single Docker image** built by **GitHub Actions** | Simplest firmware and ops; one artifact to deploy on TrueNAS. |
 
-Additional standing facts (from calibration work in `mtv.py`):
+Standing facts (from calibration work in `mtv.py`):
 - Standard: **NBTVA 32-line**, **12.5 fps**, vertical scan **bottom→top**, horizontal **right→left**, portrait **2:3**, **white-positive**, **blacker-than-black** line sync, **missing-pulse** frame sync.
-- Base playback speed that locks the user's disc: **0.95×** (45600 Hz I²S when nominal is 48000 Hz).
-- `--stabilize` (per-frame mean equalization) and a ~10 kHz band-limit are required for stable lock on moving content.
+- Signal levels: white `+28000`, black `0`, sync `-11200`; picture scaled by a **headroom** factor (~0.80) while sync keeps full depth.
+- `stabilize` (per-frame mean equalization) and a ~10 kHz **low-pass over the whole composite** are required for stable lock on moving content.
 
 ---
 
@@ -33,91 +34,74 @@ Additional standing facts (from calibration work in `mtv.py`):
    │  Telegram app│   URL / GIF / cmd   │     single Docker image   │
    └──────────────┘                     │  ┌─────────┐ ┌──────────┐ │
                                          │  │   Bot   │ │ Encoder  │ │
-                                         │  │(aiogram)│→│ ffmpeg/  │ │
+                                         │  │(aiogram)│→│ ffmpeg + │ │
                                          │  └────┬────┘ │ numpy    │ │
-                                         │       │      └────┬─────┘ │
-                                         │  ┌────▼───────────▼─────┐ │
-                                         │  │  Stream + Control svc │ │
-                                         │  │ HTTP chunked + poll   │ │
+                                         │       │      │ synth →  │ │
+                                         │       │      │ .pcm     │ │
+                                         │  ┌────▼──────┴──────────┐ │
+                                         │  │  Radio + Control svc  │ │
+                                         │  │ /radio.wav + poll     │ │
                                          │  └───────────┬───────────┘ │
                                          └──────────────┼─────────────┘
                                                         │ WiFi (LAN)
-                                          pixel frames  │  + long-poll control
-                                                        ▼
+                                        lossless PCM    │  + long-poll control
+                                        (radio stream)  ▼
                                          ┌───────────────────────────┐
                                          │   M5 Atom Lite (ESP32)    │
-                                         │  fetch → render → I²S     │
-                                         │  NBTV signal generator    │
-                                         │  (sync + levels + clock)  │
+                                         │  buffer → resample(speed) │
+                                         │  → gain/invert → I²S      │
                                          └─────────────┬─────────────┘
-                                              I²S → ES8311 DAC → 3.5mm
+                                            I²S → ES8311 → 3.5 mm TRRS
                                                         ▼
                                               Nipkow-disc TV (1920s)
 ```
 
 **Division of labor**
 - **Telegram** — remote control + content submission.
-- **TrueNAS** — decode the messy real world into clean **pixel frames** (no sync, no audio).
-- **ESP32** — the **NBTV signal generator** + disc clock. Owns sync, levels, speed.
+- **TrueNAS** — decode the messy real world into a **finished NBTV composite signal** (sync + levels + band-limit) and serve it as a continuous PCM radio stream.
+- **ESP32** — a **thin radio client**: buffer PCM, resample for disc-lock (`speed`), apply `gain`/`invert`, push to the codec.
 
-Guiding invariant: **sync is generated on the device and never travels over the network.**
-Network problems degrade the *picture* (freeze), never the *sync* (disc stays locked).
+The server always streams something: the current program's PCM, or a **test-card**
+loop when idle. Bonus: `/radio.wav` is directly playable in `ffplay`/VLC for debugging.
 
 ---
 
-## 2. Core contract — the pixel frame
+## 2. Core contract — the PCM radio stream
 
-The single most important interface.
+The single most important interface. The server emits the **finished** signal; the
+device does no synthesis.
 
-### Geometry
-| Property | Value | Notes |
-|---|---|---|
-| Lines (columns) | 32 | NBTVA 32-line |
-| Rows per line (transmitted) | 48 | natural 2:3 resolution; device interpolates → 114 active samples |
-| Bit depth | 8-bit gray | `0x00` = black, `0xFF` = white (white-positive) |
-| Frame rate | 12.5 fps | implicit; device clocks it |
-| Frame payload | 32 × 48 = **1536 bytes** | pre-arranged in scan order |
+### Signal (baked server-side)
+| Property | Value |
+|---|---|
+| Sample format | mono, signed 16-bit little-endian |
+| Sample rate | 48000 Hz (nominal, = speed 1.0) |
+| Frame timing | 32 lines × 120 samples = 3840 samples/frame → 12.5 fps |
+| Levels | white `+28000 × headroom`, black `0`, sync `-11200` (full depth) |
+| Line sync | 6 samples blacker-than-black at the end of each line |
+| Frame sync | 32nd line's sync omitted (missing-pulse marker) |
+| Conditioning | per-frame stabilize + ~10 kHz low-pass over the whole composite |
 
-### Scan order (server pre-arranges; device reads linearly)
-- Outer loop = **line** `l = 0..31` → physical disc column, **right→left**.
-- Inner loop = **sample** `s = 0..47`, **bottom→top**.
-- All flip/mirror/invert decisions are baked **server-side** (matching `--flip-h/--flip-v/--invert-signal`).
+### What the device applies live (never baked)
+- **speed** — resample ratio for disc-lock (consume `speed` input samples per output).
+- **gain** — digital output level (sync-separator headroom on this amp).
+- **invert** — polarity for the kit's sync sense.
 
-The device performs **zero geometry math** — it reads 1536 bytes already in display order.
-
-### What the device adds (never transmitted)
-- Line sync (blacker-than-black), 6 samples/line.
-- Frame sync (missing-pulse on the frame's first line).
-- 48→114 interpolation and level mapping to int16.
+### On-disk cache (`.pcm`)
+Raw mono s16le, keyed by `source + encode-params`, for instant replay/loop without
+re-downloading or re-encoding.
 
 ---
 
 ## 3. Wire format
 
-A continuous stream of frames with small headers so the device can re-lock byte
-alignment after any corruption.
+`/radio.wav` = a standard 44-byte **WAV header** (PCM, 1ch, 48000, 16-bit; RIFF/data
+sizes `0xFFFFFFFF` for an endless stream) followed by PCM samples forever. The device
+discards the 44-byte header and streams the body into its ring buffer. Players like
+`ffplay`/VLC accept the same URL directly.
 
-**Stream header (once, on connect):**
-| Field | Bytes | Value |
-|---|---|---|
-| Magic | 4 | `"NBTV"` |
-| Version | 1 | `0x01` |
-| Lines | 1 | `32` |
-| Rows | 1 | `48` |
-| Flags | 1 | bit0 = 4-bit packed (reserved, v2) |
-
-**Per-frame header (before each 1536-byte payload):**
-| Field | Bytes | Meaning |
-|---|---|---|
-| Sync word | 2 | `0xA5 0x5A` (byte-realignment anchor) |
-| Frame seq | 2 | wraps; device uses for drop detection |
-| Payload len | 2 | `1536` |
-
-On corruption the device scans forward for `0xA5 0x5A`, re-locks frame boundaries,
-and freezes the picture meanwhile. Sync output continues throughout.
-
-**On-disk cache format (`.nbtvf`):** stream header followed by N framed payloads.
-Used for instant replay/loop without re-downloading.
+The body is delivered with HTTP chunked transfer-encoding; the device de-chunks it.
+There are no per-frame headers — frame/line/sync structure is entirely *in* the PCM.
 
 ---
 
@@ -125,137 +109,126 @@ Used for instant replay/loop without re-downloading.
 
 | Endpoint | Method | Purpose |
 |---|---|---|
-| `/stream?id=<job>` | GET (chunked) | the pixel-frame stream |
-| `/control/poll?since=<seq>` | GET (long-poll) | block until a command exists, then return it |
+| `/radio.wav` | GET (chunked) | endless PCM: current program looped, or test card when idle |
+| `/control/poll?since=<seq>` | GET (long-poll) | block until a device command exists, then return it |
 | `/status` | POST | device pushes status (~1 Hz) |
 | `/health` | GET | liveness |
-| `/jobs` (bot-internal) | — | enqueue / replace current job |
 
 ### Flow control
-No rate field. The device drains its buffer at exactly 12.5 fps; **TCP backpressure**
-paces the server, which streams ahead into the device's ~0.5 s ring buffer.
+No rate field. The device drains its buffer at its real playback rate; **TCP
+backpressure** paces the server, which streams ahead into the device's ~0.5 s ring
+buffer. Program changes bump a token so the streamer switches source seamlessly
+without a reconnect.
 
 ### Control commands (long-poll response, JSON)
-Server → device:
-- `play` — `id`, `loop` (bool)
-- `stop`
-- `freeze`
-- `speed` — `value` (e.g. `0.95`)
+Server → device (device-local knobs only):
+- `speed` — `value` (e.g. `1.005`)
+- `invert` — toggle polarity
 - `reboot`
 
-Device → server (`/status`, ~1 Hz):
-- `state` — `idle|playing|frozen|buffering`
-- `id`, `frame_seq`, `buffer_ms`, `underruns`, `rssi`, `speed`
+Program changes (`play`/`stop`/`skip`/`loop`) are **server-side** — they change the
+bytes on `/radio.wav`, so the device needs no command for them.
+
+Device → server (`/status`, ~1 Hz): `state` (`playing|buffering|nolink`),
+`buffer_ms`, `underruns`, `rssi`, `speed`.
 
 ### Security (single user)
-Every Telegram update is checked against one allow-listed `user_id`; everything else
-is dropped silently. Device endpoints are LAN-only + a shared static token header.
+Every Telegram update is checked against one allow-listed `user_id`. Device endpoints
+are LAN-only + a shared static token header (`X-Device-Token`).
 
 ---
 
 ## 5. Server (TrueNAS Scale) — single image
 
-One Docker image, three logical parts, launched together.
+One Docker image, launched together.
 
-### 5.1 Bot (Telegram, aiogram)
+### 5.1 Bot (Telegram, aiogram) — `bot.py`
 | Input | Action |
 |---|---|
-| YouTube URL | enqueue encode → autoplay |
-| GIF / video file | enqueue encode → autoplay |
-| `/stop` `/skip` `/loop` | control passthrough |
-| `/speed 0.95` | set device speed (persists to NVS via device) |
-| `/status` | echo device status |
-| `/test` | command device to render its built-in test card |
+| YouTube URL / GIF / video | encode → `.pcm` → set as current program (loop) |
+| `/stop` | go idle (test card) |
+| `/skip` | play the queued item |
+| `/loop on\|off` | loop the current item |
+| `/speed 0.95` | device speed command (persists to NVS on device) |
+| `/invert` | device polarity toggle |
+| `/status` | echo program + device status |
+| `/test` | go idle (streams the test card) |
 
-Job model: one **now-playing** + a 1-deep **next** slot (newest submission wins).
-No multi-user queue.
+Program model: one **now-playing** + a 1-deep **next** slot (newest wins).
 
-### 5.2 Encoder (server-side `mtv.py` pipeline, retargeted)
-Reuses the existing pipeline but outputs **pixel frames**, not a WAV waveform, and
-**drops audio entirely**:
+### 5.2 Encoder + synth — `encoder.py` + `render.py`
 1. `yt-dlp` download (cap 360p).
-2. `ffmpeg`: crop to 2:3 → scale to **32×48** → grayscale → 12.5 fps, **no audio**.
-3. numpy: **contrast/brightness/gamma**, then **stabilize** (per-frame mean equalization) in the **pixel domain**.
-4. Arrange bytes in **scan order** (§2).
-5. Emit to the stream service as a live pipe and/or a cached `.nbtvf`.
+2. `ffmpeg`: crop to 2:3 → scale to **32 × 114** grayscale → 12.5 fps, no audio.
+3. `render.frames_to_pcm` (port of `mtv.py` `frames_to_signal` + `lowpass_fir`):
+   stabilize → level map with **headroom** → line/frame sync → **10 kHz low-pass** →
+   clamp to mono s16le.
+4. Cache as `.pcm` keyed by `source + params`.
 
-**Removed from the server:** `frames_to_signal` (sync insertion, level mapping,
-lowpass, WAV writing) — these move to the device.
+`render.py` also builds the idle **test-card** PCM once at startup.
 
-**Caching:** store rendered `.nbtvf` keyed by `url + encode-params` for instant
-replay/loop.
-
-### 5.3 Stream + control service (aiohttp/FastAPI)
-- Serves `/stream` from a live encode or cached `.nbtvf`.
-- Holds long-poll command queue per device; relays bot commands.
+### 5.3 Radio + control service — `stream.py`
+- `/radio.wav`: writes the WAV header, then loops the current program's `.pcm`
+  (or the test card when idle), switching source on the program token. TCP
+  backpressure paces it.
+- Holds the long-poll command queue; relays bot device-commands.
 - Collects device `/status`; derives online/offline from heartbeat staleness.
 
 ---
 
 ## 6. ESP32 firmware
 
-### 6.1 State machine
+### 6.1 Loop (no state machine)
+The device always does the same thing: pull PCM from the ring, resample, output.
+
 ```
-        ┌─────────┐
-        │  BOOT   │  load NVS (wifi, server, token, speed)
-        └────┬────┘
-             ▼
-        ┌─────────┐   fail   ┌──────────────┐
-        │  WIFI   │ ───────► │  TEST CARD    │ (offline: local card, sync live)
-        └────┬────┘          └──────┬───────┘
-        ok   ▼                      │ wifi back
-        ┌─────────┐                 │
-        │ CONNECT │ ◄───────────────┘  start long-poll loop, POST /status
-        └────┬────┘
-             ▼
-        ┌─────────┐  no job
-        │  IDLE   │ ───────► render TEST CARD (sync stays live)
-        └────┬────┘
-       play  ▼
-        ┌──────────────┐  prefill ring buffer (~0.5s)
-        │  BUFFERING   │
-        └────┬─────────┘
-             ▼
-        ┌──────────────┐  underrun → FREEZE last frame, keep sync, refill, resume.
-        │   PLAYING    │  socket drop → CONNECT.  stop → IDLE.  freeze → FROZEN.
-        └──────────────┘
+   BOOT ─ load NVS (wifi, server, token, speed, gain, invert)
+     │
+     ├─ (no creds / button held) → SoftAP provisioning portal
+     ▼
+   audio_begin() @ 48 kHz ─ start net tasks (radio + poll + status)
+     ▼
+   loop(): drain commands / serial / button → emit_block()
+                                              (resample ring → gain/invert → I²S)
 ```
 
-**Invariant:** the I²S engine *always* emits a valid NBTV waveform — live frame,
-frozen frame, or test card. The disc never loses lock.
+Two background tasks on core 0: the **radio client** (fills the ring) and the
+**poll/status** task. The output loop runs on core 1.
 
-### 6.2 Render path (the `frames_to_signal` port)
-Per frame, build **3840 samples** (32 lines × 120 samples; 32 × 120 × 12.5 = 48000):
-- Per line: 6 sync samples (frame's first line = missing-pulse pattern), then
-  interpolate the 48 transmitted rows → **114 active samples**, map gray→level.
-- Levels (device constants, from calibration): white ≈ `+28000`, black `0`,
-  sync ≈ `-11200`, peak-normalized to ~`30000`.
-- Optional cheap 1-pole smooth on the active region (stands in for `--lowpass`); off by default.
+### 6.2 Radio client — `net.cpp`
+Connect `/radio.wav`, de-chunk, discard the 44-byte WAV header, then read PCM into
+the **sample ring buffer** with backpressure (`sb_push` blocks when full).
+Auto-reconnects on drop. `poll_task` handles `speed`/`invert`/`reboot` + posts status.
 
-Cost: microseconds of ESP32 work per frame.
+### 6.3 Output — `nbtv_player.ino` + `sample_buffer.*`
+- `sample_buffer`: thread-safe int16 ring (~0.5 s = 24000 samples).
+- `emit_block()`: a continuous linear resampler. Playback runs at a fixed 48 kHz;
+  it consumes `speed` input samples per output sample (fractional index carried
+  across blocks), then applies `invert` and `gain`, mono→stereo, `audio_write`.
+  On underrun it holds the last sample and counts it; the I²S never stops.
 
-### 6.3 Clock & speed
-- I²S sample rate = `48000 × speed` (e.g. `0.95` → `45600`).
-- `speed` command or button changes the I²S clock divider **live** — no re-encode,
-  no stream change. Device-side equivalent of `--tune`.
+### 6.4 Clock & speed
+The ES8311 runs fixed at 48 kHz (its clock table has no `48000×speed` entry, and
+M5's I²S is stereo). Speed is done purely by the resampler ratio — no clock change,
+no re-encode. Device-side equivalent of `--tune`.
 
-### 6.4 Button (Atom Lite top button)
+### 6.5 Button (Atom Lite top button)
 | Gesture | Action |
 |---|---|
-| single | stop / start (toggle) |
-| double | skip to "next" slot |
+| single | print current tune line |
+| double | toggle invert |
 | long-press | cycle speed presets around 0.95 (fine-tune lock) |
 | hold at boot | enter WiFi provisioning (SoftAP captive page) |
 
-### 6.5 Persistent config (NVS)
-`wifi_ssid`, `wifi_pass`, `server_url`, `token`, `speed`, `user_label`.
-Provisioned via SoftAP captive page on first boot or boot-hold.
+### 6.6 Persistent config (NVS) — `settings.*`
+`wifi_ssid`, `wifi_pass`, `server_url`, `token`, `speed`, `invert`, `gain`.
+Optional compile-time `secrets.h` overrides connection fields at boot.
 
-### 6.6 Hardware notes (Atomic Audio-3.5 Base)
-- ES8311 mono codec over **I²S** (data) + **I²C** (control); 3.5 mm out is the clean
-  **DAC (DACP)** path, not the Class-D amp — suitable for NBTV.
-- TRRS wiring is **CTIA**; the disc connects to the DAC output line.
-- Output is AC-coupled → hence the need for `--stabilize` (floating black level).
+### 6.7 Hardware notes (Atomic Audio-3.5 Base)
+- ES8311 mono codec over **I²S** (data) + **I²C** (control), NS4150B Class-D amp.
+- Output is hot for a speaker, so **gain ≈ 0.05** keeps the signal in the amp's linear
+  region (higher clips the sync tips → lock loss).
+- TRRS wiring is **CTIA**; mono is mirrored to L+R so any tip/ring tap works.
+- AC-coupled output → hence server-side `stabilize` (floating black level).
 
 ---
 
@@ -263,12 +236,15 @@ Provisioned via SoftAP captive page on first boot or boot-hold.
 
 | Event | Behavior | Sync impact |
 |---|---|---|
-| WiFi drop | → CONNECT, render test card | none (local sync) |
-| Server down | retry backoff, test card | none |
-| Buffer underrun | freeze last frame, refill | none |
-| Corrupt bytes | hunt `0xA5 0x5A`, re-lock | none (brief picture freeze) |
+| WiFi drop | radio client reconnects; ring drains | brief (until buffer empties), then silence/roll |
+| Server down | retry backoff | as above |
+| Buffer underrun | hold last sample, count it, resume | brief |
+| Program change | seamless source switch (token) | none |
 | Wrong Telegram user | dropped at allow-list | n/a |
-| Power loss | reboot → last speed from NVS | re-locks on its own |
+| Power loss | reboot → speed/gain/invert from NVS | re-locks on its own |
+
+The main robustness lever is the ring buffer size vs. WiFi quality: lossless PCM is
+~96 KB/s, so a weak link is the primary underrun risk.
 
 ---
 
@@ -276,17 +252,16 @@ Provisioned via SoftAP captive page on first boot or boot-hold.
 
 | Item | Value |
 |---|---|
-| Frame payload | 1536 B (8-bit) |
-| Frame rate | 12.5 fps |
-| Stream bitrate | ~**154 kbps** |
-| Device ring buffer | ~0.5 s ≈ 10 KB pixels + ~96 KB int16 I²S scratch |
-| vs. full-PCM transport | 768 kbps → ~5× reduction |
+| Stream format | mono s16le @ 48 kHz |
+| Stream bitrate | ~**768 kbps** (~96 KB/s) |
+| Device ring buffer | ~0.5 s ≈ 48 KB (24000 × int16) |
+| Trade-off | lossless (sync-safe) over compressed (sync-breaking) |
 
-Comfortable for ESP32 RAM and any LAN WiFi.
+Comfortable for ESP32 RAM; needs a decent LAN WiFi link.
 
 ---
 
-## 9. Repository layout (proposed)
+## 9. Repository layout
 
 ```
 NBTV/
@@ -294,71 +269,66 @@ NBTV/
 ├─ server/
 │  ├─ app/
 │  │  ├─ bot.py                   # Telegram (aiogram), allow-list
-│  │  ├─ encoder.py               # mtv.py pipeline → pixel frames (no audio)
-│  │  ├─ stream.py                # /stream chunked, .nbtvf cache
-│  │  ├─ control.py               # /control/poll, /status, job model
-│  │  └─ nbtvf.py                 # wire/cache format read+write
-│  ├─ pyproject.toml
-│  └─ Dockerfile                  # single image (bot+encoder+stream)
+│  │  ├─ encoder.py               # download + ffmpeg grey frames -> .pcm
+│  │  ├─ render.py                # frames_to_pcm (synth + lowpass + test card)
+│  │  ├─ stream.py                # /radio.wav + /control/poll + /status
+│  │  ├─ control.py               # program model, token, device commands
+│  │  ├─ nbtv.py                  # constants + WAV/PCM helpers
+│  │  ├─ config.py                # env config
+│  │  └─ server.py / __main__.py  # aiohttp + bot in one loop
+│  ├─ docker-compose.yml          # TrueNAS Custom App (inline env)
+│  ├─ pyproject.toml / requirements.txt
+│  └─ Dockerfile                  # single image (bot+encoder+radio)
 ├─ firmware/                      # ESP32, Arduino IDE sketch
 │  └─ nbtv_player/                # open this folder as the sketch
-│     ├─ nbtv_player.ino          # setup/loop state machine
-│     ├─ nbtv_render.cpp/.h       # frames_to_signal port (sync+levels+interp)
-│     ├─ audio_out.cpp/.h         # ES8311 via M5EchoBase, clock/speed
-│     ├─ net.cpp/.h               # stream fetch + long-poll + status
-│     ├─ frame_buffer.cpp/.h      # ring buffer, underrun/freeze
+│     ├─ nbtv_player.ino          # setup/loop + resampler
+│     ├─ audio_out.cpp/.h         # ES8311 via M5EchoBase, mono->stereo I²S
+│     ├─ net.cpp/.h               # /radio.wav client + long-poll + status
+│     ├─ sample_buffer.cpp/.h     # int16 ring buffer, underrun handling
 │     ├─ button.cpp/.h            # gestures
-│     ├─ settings.cpp/.h          # NVS, SoftAP provisioning
-│     └─ nbtv_config.h            # NBTV constants + Atom pin map
+│     ├─ settings.cpp/.h          # NVS, SoftAP provisioning, secrets.h
+│     └─ nbtv_config.h            # NBTV timing + Atom pin map
 └─ .github/workflows/
-   ├─ server-image.yml            # build+push single Docker image (GHCR)
-   └─ firmware.yml                # build firmware, attach .bin to release
+   └─ server-image.yml            # build+push single Docker image (GHCR)
 ```
 
-(Existing `nbtv-tools-and-doc-V1-4/` and `Disk/` remain as reference/calibration.)
+Firmware is built/flashed locally from the Arduino IDE (no CI); only the server
+image is built by GitHub Actions.
+
+(Local-only `nbtv-tools-and-doc-V1-4/` and `Disk/` remain as reference/calibration,
+gitignored.)
 
 ---
 
 ## 10. GitHub Actions (single-image assembly)
 
-**`server-image.yml`**
-- Trigger: push to `main` touching `server/**`, and tags `v*`.
-- Steps: checkout → set up Buildx → log in to **GHCR** → `docker build` the single
-  image → push `ghcr.io/<user>/nbtv-server:{sha, latest, tag}`.
-- TrueNAS pulls this image (Custom App) and runs it.
+**`server-image.yml`** — push to `main` touching `server/**` (and tags `v*`):
+checkout → Buildx → GHCR login → build → push `ghcr.io/<user>/nbtv-server:{sha,latest,tag}`.
+TrueNAS pulls it (Custom App).
 
-**`firmware.yml`**
-- Trigger: push touching `firmware/**`, and tags `v*`.
-- Steps: checkout → `arduino-cli` (ESP32 core + M5Atomic-EchoBase / M5Unified /
-  ArduinoJson) → `arduino-cli compile --fqbn esp32:esp32:m5stack-atom` → upload
-  the `.bin` artifact; on tag, attach to a GitHub Release for flashing.
-- Local dev is the Arduino IDE: open `firmware/nbtv_player/`, board "M5Stack-ATOM".
+**Firmware** — no CI. Built and flashed locally from the Arduino IDE: open
+`firmware/nbtv_player/`, board "M5Stack-ATOM", libraries M5Atomic-EchoBase /
+M5Unified / ArduinoJson.
 
-Secrets: `GHCR` uses the built-in `GITHUB_TOKEN`. Telegram `BOT_TOKEN` and
-`ALLOWED_USER_ID` are **runtime** env vars on TrueNAS, never baked into the image.
+Secrets: GHCR uses the built-in `GITHUB_TOKEN`. `BOT_TOKEN`, `ALLOWED_USER_ID`,
+`DEVICE_TOKEN` are **runtime** env on TrueNAS, never baked into the image.
 
 ---
 
-## 11. Build phases (execution order)
+## 11. Validation
 
-1. **Firmware signal core, offline** — port `frames_to_signal`, render the built-in
-   **test card** to I²S, lock the disc at 0.95. *(Hardest part, zero networking.)*
-2. **Static frame over HTTP** — fetch one `.nbtvf`, loop it. Validates wire format +
-   interpolation.
-3. **Live stream + buffering** — `/stream` chunked, ring buffer, underrun freeze.
-4. **Control** — long-poll commands + `/status`; button gestures.
-5. **Server bot + encoder** — retarget `mtv.py` to pixel output (no audio), wire into
-   stream service; Telegram front end + allow-list.
-6. **Provisioning + NVS polish**, then GitHub Actions for both artifacts.
-
-Phase 1 is the real risk; everything after is plumbing.
+1. **Server**: `ffplay http://<host>:32125/radio.wav` plays the test-card signal
+   (proves synth + stream end-to-end).
+2. **Device**: lock the test card, then a video; re-trim `speed` live. Busy scenes
+   hold because headroom + low-pass are baked server-side.
+3. **Resilience**: drop WiFi briefly to confirm buffer ride-through / graceful underrun.
 
 ---
 
-## 12. Deferred to v2 (explicitly out of scope for v1)
+## 12. Deferred to v2 (out of scope for v1)
 
+- Lossless-compressed transport (FLAC) for weak WiFi.
 - WebSocket control (replacing long-poll).
-- 4-bit packed transport (`flags` bit0).
 - Multi-user / queue.
-- Any audio path.
 - Device-side OTA firmware updates.
+```

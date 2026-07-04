@@ -20,7 +20,7 @@ bool audio_begin() {
     // Fixed STANDARD rate so the ES8311 clock table resolves; ATOM pin map.
     bool ok = echo.init(NBTV_BASE_RATE, PIN_I2C_SDA, PIN_I2C_SCL, PIN_I2S_DIN,
                         PIN_I2S_WS, PIN_I2S_DOUT, PIN_I2S_BCK, Wire);
-    if (ok) echo.setSpeakerVolume(100);  // full-scale DAC swing; NBTV needs level
+    if (ok) echo.setSpeakerVolume(85);  // full-scale DAC swing; NBTV needs level
     return ok;
 }
 

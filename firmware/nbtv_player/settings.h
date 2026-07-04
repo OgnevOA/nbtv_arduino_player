@@ -11,7 +11,6 @@ struct Settings {
     float  speed;        // disc-lock trim, default 0.95
     bool   invert;       // signal polarity for sync-positive kits
     float  gain;         // digital output level 0..1 (sync-separator headroom)
-    bool   lowpass;      // full-signal band-limit (the sync fix)
 };
 
 void settings_load(Settings &s);

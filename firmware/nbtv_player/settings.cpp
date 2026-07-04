@@ -48,7 +48,6 @@ void settings_load(Settings &s) {
     s.speed      = p.getFloat("speed", NBTV_SPEED);
     s.invert     = p.getBool("invert", false);
     s.gain       = p.getFloat("gain", NBTV_GAIN);
-    s.lowpass    = p.getBool("lp", true);
     p.end();
     apply_secrets(s);
 }
@@ -63,7 +62,6 @@ void settings_save(const Settings &s) {
     p.putFloat("speed", s.speed);
     p.putBool("invert", s.invert);
     p.putFloat("gain", s.gain);
-    p.putBool("lp", s.lowpass);
     p.end();
 }
 

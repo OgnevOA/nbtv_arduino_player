@@ -1,10 +1,15 @@
-"""HTTP handlers: the pixel-frame stream, control long-poll, and status.
+"""HTTP handlers: the PCM radio stream, control long-poll, and status.
 
 The device flow:
-  GET  /stream?id=<job>       -> chunked .nbtvf body (loops server-side if asked)
-  GET  /control/poll?since=N  -> long-poll; returns the next command as JSON
+  GET  /radio.wav             -> endless mono s16le PCM (WAV header + body)
+  GET  /control/poll?since=N  -> long-poll; returns the next device command
   POST /status                -> device pushes its status JSON (~1 Hz)
   GET  /health                -> liveness
+
+/radio.wav always streams: the current program's PCM (looped), or a test-card
+loop when idle. It switches source seamlessly when the program token changes,
+and TCP backpressure paces the sender to the device's playback rate. The 44-byte
+WAV header also makes it directly playable in ffplay/VLC for debugging.
 """
 
 from __future__ import annotations
@@ -18,7 +23,7 @@ from . import nbtv
 from .config import settings
 from .control import Hub
 
-CHUNK = 64 * 1024
+CHUNK = 32 * 1024
 
 
 def _authed(request: web.Request) -> bool:
@@ -27,46 +32,62 @@ def _authed(request: web.Request) -> bool:
     return request.headers.get("X-Device-Token") == settings.device_token
 
 
-def job_path(job_id: str) -> Path:
-    return settings.cache_dir / f"{job_id}.nbtvf"
+async def _write_bytes(resp: web.StreamResponse, data: bytes,
+                       hub: Hub, token: int) -> bool:
+    """Write a whole buffer in CHUNKs. Return False if the program changed."""
+    for i in range(0, len(data), CHUNK):
+        await resp.write(data[i:i + CHUNK])
+        if hub.program_token != token:
+            return False
+    return True
 
 
-async def handle_stream(request: web.Request) -> web.StreamResponse:
+async def _write_file(resp: web.StreamResponse, path: Path,
+                      hub: Hub, token: int) -> bool:
+    """Stream a PCM file in CHUNKs. Return False if the program changed."""
+    with open(path, "rb") as fp:
+        while True:
+            chunk = fp.read(CHUNK)
+            if not chunk:
+                return True
+            await resp.write(chunk)
+            if hub.program_token != token:
+                return False
+
+
+async def handle_radio(request: web.Request) -> web.StreamResponse:
     if not _authed(request):
         raise web.HTTPForbidden()
-    job_id = request.query.get("id", "")
     hub: Hub = request.app["hub"]
-    path = job_path(job_id)
-    if not job_id or not path.exists():
-        raise web.HTTPNotFound(text="unknown job id")
-
-    loop = request.query.get("loop") == "1" or (
-        hub.current is not None and hub.current.id == job_id and hub.current.loop
-    )
+    testcard: bytes = request.app["testcard_pcm"]
 
     resp = web.StreamResponse(
-        status=200,
-        headers={"Content-Type": "application/octet-stream",
-                 "Cache-Control": "no-store"},
+        headers={"Content-Type": "audio/wav", "Cache-Control": "no-store"},
     )
     resp.enable_chunked_encoding()
     await resp.prepare(request)
+    await resp.write(nbtv.wav_stream_header())
 
     try:
         while True:
-            with open(path, "rb") as fp:
-                # Stream header once per pass; the device tolerates re-headers
-                # at loop boundaries because it re-syncs on the frame anchor.
-                while True:
-                    chunk = fp.read(CHUNK)
-                    if not chunk:
+            token, path, loop = hub.program_source()
+            if path is None or not path.exists():
+                # Idle: loop the test card until the program changes.
+                while hub.program_token == token:
+                    if not await _write_bytes(resp, testcard, hub, token):
                         break
-                    await resp.write(chunk)
-            if not loop:
-                break
+            else:
+                # Play the program's PCM, looping if requested.
+                while hub.program_token == token:
+                    if not await _write_file(resp, path, hub, token):
+                        break
+                    if hub.program_token != token:
+                        break
+                    if not loop:
+                        hub.stop()   # finite item ended -> go idle (test card)
+                        break
     except (ConnectionResetError, asyncio.CancelledError):
         pass
-    await resp.write_eof()
     return resp
 
 
@@ -101,7 +122,7 @@ async def handle_health(request: web.Request) -> web.Response:
 
 
 def add_routes(app: web.Application) -> None:
-    app.router.add_get("/stream", handle_stream)
+    app.router.add_get("/radio.wav", handle_radio)
     app.router.add_get("/control/poll", handle_poll)
     app.router.add_post("/status", handle_status)
     app.router.add_get("/health", handle_health)

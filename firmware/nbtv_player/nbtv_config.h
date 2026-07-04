@@ -1,38 +1,18 @@
-// NBTVA 32-line constants + M5 Atom Lite / Atomic Audio-3.5 pin map.
+// NBTVA 32-line timing + M5 Atom Lite / Atomic Audio-3.5 pin map.
 //
-// These MUST match server/app/nbtv.py. The device receives pixels only and
-// synthesises the full NBTV waveform locally (sync + levels + interpolation),
-// so sync integrity never depends on the network.
+// In the radio architecture the device just plays a PCM stream, so it only
+// needs the base sample rate / frame rate. The full signal (sync + levels +
+// band-limit) is synthesized on the server (server/app/nbtv.py + render.py).
 #pragma once
 
 #include <stdint.h>
 
-// --- NBTVA 32-line standard --------------------------------------------------
+// --- NBTVA 32-line timing ----------------------------------------------------
 static const int   NBTV_BASE_RATE   = 48000;  // I2S rate at speed 1.0
 static const float NBTV_BASE_FPS    = 12.5f;  // 750 rpm
 static const int   NBTV_LINES       = 32;     // lines per frame
 static const int   NBTV_SPL         = 120;    // samples per line
-static const int   NBTV_SYNC_SPL    = 6;      // sync pulse width (samples)
-static const int   NBTV_ACTIVE_SPL  = 114;    // active samples per line
-static const int   NBTV_COLS        = 32;     // one "line" == one image column
-static const int   NBTV_ROWS_TX     = 48;     // rows transmitted per line
-
-static const int   NBTV_FRAME_BYTES = NBTV_COLS * NBTV_ROWS_TX;       // 1536
-static const int   NBTV_SAMPLES     = NBTV_LINES * NBTV_SPL;          // 3840
-
-// Signal levels (calibrated against the NBTVA CD reference). White-positive,
-// black at 0, blacker-than-black sync tip.
-static const int16_t NBTV_WHITE = 28000;
-static const int16_t NBTV_BLACK = 0;
-static const int16_t NBTV_SYNC  = -11200;  // -0.40 * WHITE
-
-// --- .nbtvf wire format ------------------------------------------------------
-static const uint8_t NBTV_MAGIC[4]   = {'N', 'B', 'T', 'V'};
-static const uint8_t NBTV_VERSION     = 1;
-static const uint8_t NBTV_STREAM_HDR  = 8;   // magic(4)+ver(1)+lines(1)+rows(1)+flags(1)
-static const uint8_t NBTV_FRAME_SYNC0 = 0xA5;
-static const uint8_t NBTV_FRAME_SYNC1 = 0x5A;
-static const uint8_t NBTV_FRAME_HDR   = 6;   // sync(2)+seq(2)+len(2)
+static const int   NBTV_SAMPLES     = NBTV_LINES * NBTV_SPL;   // 3840 / frame
 
 // --- Hardware pin map: M5 Atom Lite (ESP32) + Atomic Audio-3.5 Base ----------
 // From M5EchoBase ATOM (CONFIG_IDF_TARGET_ESP32) init:

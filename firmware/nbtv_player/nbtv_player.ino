@@ -4,110 +4,105 @@
 // files in this folder are compiled automatically. Board: "M5Stack-ATOM".
 // Install libraries via Library Manager: M5Atomic-EchoBase, M5Unified, ArduinoJson.
 //
-// The output loop ALWAYS emits a valid NBTV waveform (live frame, frozen frame,
-// or test card), so the mechanical disc never loses lock regardless of network
-// state. Networking runs on core 0; this render/output loop runs on core 1.
+// Radio architecture: the SERVER synthesizes the finished NBTV composite signal
+// (sync + levels + band-limit + headroom) and streams it as lossless mono PCM.
+// This device is a thin client: it buffers the PCM, resamples it for disc-lock
+// (speed), applies gain/invert, and pushes it to the codec. Networking runs on
+// core 0; this output loop runs on core 1.
 #include <Arduino.h>
 #include <WiFi.h>
 
 #include "nbtv_config.h"
-#include "nbtv_render.h"
 #include "audio_out.h"
-#include "frame_buffer.h"
+#include "sample_buffer.h"
 #include "settings.h"
 #include "button.h"
 #include "net.h"
 
-enum State { ST_IDLE, ST_PLAYING, ST_FROZEN };
-
 static Settings g_set;
-static State    g_state = ST_IDLE;
-
-static uint8_t  g_test[NBTV_FRAME_BYTES];
-static uint8_t  g_cur[NBTV_FRAME_BYTES];
-static uint8_t  g_last[NBTV_FRAME_BYTES];
-static bool     g_have_last = false;
-static int16_t  g_samples[NBTV_SAMPLES];
-
 static int      g_underruns = 0;
-static uint16_t g_frameseq = 0;
-static char     g_cur_id[24] = "";
 
-// Fine speed steps for on-device disc-lock trimming (long-press cycles these).
+// Fine speed presets for on-device disc-lock trimming (long-press cycles these).
 static const float SPEED_PRESETS[] = {
     0.90f, 0.91f, 0.92f, 0.93f, 0.94f, 0.95f,
     0.96f, 0.97f, 0.98f, 0.99f, 1.00f};
 static int g_speed_idx = 5;  // 0.95
 
-// Time-stretch output buffer. The codec runs at a FIXED 48000 Hz; "speed" is
-// achieved by resampling each frame to 48000/(12.5*speed) samples (more samples
-// = longer frame period = slower effective fps = matches a slower disc).
-static const int MAX_OUT = 5200;
-static int16_t g_out[MAX_OUT];
-
-// Output level and band-limit now live in Settings (NVS), so serial/button
-// tuning survives reboots. See g_set.gain / g_set.lowpass.
+// Output block: 1024 samples ~= 21 ms; audio_write blocks, pacing the loop.
+static const int OUT_BLOCK = 1024;
+static int16_t g_out[OUT_BLOCK];
 
 static float effective_fps() { return NBTV_BASE_FPS * g_set.speed; }
 
-static int stretch_for(float speed) {
-    int n = (int)lroundf((float)NBTV_SAMPLES / speed);
-    if (n > MAX_OUT) n = MAX_OUT;
-    if (n < 1) n = 1;
-    return n;
+// --- continuous resampler pulling from the sample ring --------------------
+// Playback runs at a FIXED 48000 Hz codec rate; "speed" is achieved by
+// consuming `speed` input samples per output sample (>1 = faster disc).
+static int16_t s_in[512];
+static int  s_in_len = 0, s_in_pos = 0;
+
+static bool pull_input(int16_t &v) {
+    if (s_in_pos >= s_in_len) {
+        s_in_len = sb_read(s_in, (int)(sizeof(s_in) / sizeof(s_in[0])));
+        s_in_pos = 0;
+        if (s_in_len == 0) return false;   // underrun
+    }
+    v = s_in[s_in_pos++];
+    return true;
 }
 
-static void emit(const uint8_t *frame) {
-    nbtv_render_frame(frame, g_samples, g_set.invert);
-    if (g_set.lowpass) nbtv_bandlimit(g_samples, NBTV_SAMPLES);
-    // Linear-resample the composite (picture + sync) to set the frame period.
-    int n = stretch_for(g_set.speed);
-    float step = (n > 1) ? (float)(NBTV_SAMPLES - 1) / (n - 1) : 0.0f;
-    for (int i = 0; i < n; ++i) {
-        float pos = i * step;
-        int i0 = (int)pos;
-        int i1 = (i0 + 1 < NBTV_SAMPLES) ? i0 + 1 : NBTV_SAMPLES - 1;
-        float f = pos - i0;
-        float s = (g_samples[i0] * (1.0f - f) + g_samples[i1] * f) * g_set.gain;
-        if (s > 32767.0f) s = 32767.0f;
-        if (s < -32768.0f) s = -32768.0f;
-        g_out[i] = (int16_t)lroundf(s);
+static float   s_frac = 0.0f;
+static int16_t s_prev = 0, s_cur = 0;
+static bool    s_primed = false;
+
+static void emit_block() {
+    // Prime with the first two input samples once data is available.
+    if (!s_primed) {
+        int16_t a;
+        if (!pull_input(a)) {                 // nothing buffered yet -> silence
+            memset(g_out, 0, sizeof(g_out));
+            audio_write(g_out, OUT_BLOCK);
+            return;
+        }
+        s_prev = a;
+        s_cur = pull_input(a) ? a : s_prev;
+        s_frac = 0.0f;
+        s_primed = true;
     }
-    audio_write(g_out, n);
+
+    bool underran = false;
+    for (int i = 0; i < OUT_BLOCK; ++i) {
+        float out = s_prev + (s_cur - s_prev) * s_frac;
+        if (g_set.invert) out = -out;
+        out *= g_set.gain;
+        if (out > 32767.0f) out = 32767.0f;
+        if (out < -32768.0f) out = -32768.0f;
+        g_out[i] = (int16_t)lroundf(out);
+
+        s_frac += g_set.speed;
+        while (s_frac >= 1.0f) {
+            s_frac -= 1.0f;
+            s_prev = s_cur;
+            int16_t nv;
+            if (pull_input(nv)) s_cur = nv;
+            else underran = true;             // hold last sample
+        }
+    }
+    if (underran) g_underruns++;
+    audio_write(g_out, OUT_BLOCK);
 }
 
 static void handle_command(const Command &c) {
     switch (c.type) {
-        case CMD_PLAY:
-            Serial.printf("[cmd] play id=%s loop=%d\n", c.id, c.flag);
-            strncpy(g_cur_id, c.id, sizeof(g_cur_id) - 1);
-            g_state = ST_PLAYING;
-            g_underruns = 0;
-            net_stream_start(c.id, c.flag);
-            break;
-        case CMD_STOP:
-            Serial.println("[cmd] stop");
-            g_state = ST_IDLE;
-            net_stream_stop();
-            break;
-        case CMD_FREEZE:
-            Serial.println("[cmd] freeze");
-            g_state = ST_FROZEN;
-            net_stream_stop();
-            break;
-        case CMD_TESTCARD:
-            Serial.println("[cmd] testcard");
-            g_state = ST_IDLE;
-            net_stream_stop();
-            break;
         case CMD_SPEED:
             g_set.speed = c.value;
             settings_save(g_set);
             Serial.printf("[cmd] speed=%.4f (%.2f fps)\n", g_set.speed,
                           effective_fps());
             break;
-        case CMD_LOOP:
-            // Loop is handled server-side (it keeps re-sending the stream).
+        case CMD_INVERT:
+            g_set.invert = !g_set.invert;
+            settings_save(g_set);
+            Serial.printf("[cmd] invert=%d\n", g_set.invert);
             break;
         case CMD_REBOOT:
             Serial.println("[cmd] reboot");
@@ -119,15 +114,13 @@ static void handle_command(const Command &c) {
 }
 
 static void print_tune() {
-    Serial.printf("[tune] speed=%.4f (%.2f fps)  gain=%.2f  invert=%d  lowpass=%d  state=%d\n",
-                  g_set.speed, effective_fps(), g_set.gain, g_set.invert,
-                  (int)g_set.lowpass, (int)g_state);
+    Serial.printf("[tune] speed=%.4f (%.2f fps)  gain=%.2f  invert=%d\n",
+                  g_set.speed, effective_fps(), g_set.gain, g_set.invert);
 }
 
-// Live bench tuning over the USB serial monitor (mirrors the desktop --tune):
-//   +/-  speed FINE  (0.0002)       ,/.  speed COARSE (0.005)
-//   [/]  output level down/up       i    invert polarity
-//   l    toggle low-pass (sync fix) t    show test card    p  print status
+// Live bench tuning over the USB serial monitor:
+//   +/-  speed FINE (0.0002)     ,/.  speed COARSE (0.005)
+//   [/]  output level down/up    i    invert polarity     p  print status
 static void handle_serial() {
     bool changed = false;
     while (Serial.available()) {
@@ -140,8 +133,6 @@ static void handle_serial() {
             case ']': g_set.gain += 0.05f; changed = true; break;
             case '[': g_set.gain -= 0.05f; changed = true; break;
             case 'i': case 'I': g_set.invert = !g_set.invert; changed = true; break;
-            case 'l': case 'L': g_set.lowpass = !g_set.lowpass; changed = true; break;
-            case 't': case 'T': g_state = ST_IDLE; net_stream_stop(); break;
             case 'p': case 'P': break;  // just print below
             default: continue;
         }
@@ -157,9 +148,7 @@ static void handle_serial() {
 static void handle_button() {
     switch (button_poll()) {
         case BTN_SINGLE:
-            Serial.println("[btn] single -> idle/test card");
-            if (g_state == ST_PLAYING) { g_state = ST_IDLE; net_stream_stop(); }
-            else { g_state = ST_IDLE; }   // show test card
+            print_tune();
             break;
         case BTN_LONG:
             g_speed_idx = (g_speed_idx + 1) % (int)(sizeof(SPEED_PRESETS) /
@@ -170,7 +159,7 @@ static void handle_button() {
                           effective_fps());
             break;
         case BTN_DOUBLE:
-            g_set.invert = !g_set.invert;  // handy field polarity toggle
+            g_set.invert = !g_set.invert;
             settings_save(g_set);
             Serial.printf("[btn] double -> invert=%d\n", g_set.invert);
             break;
@@ -182,15 +171,16 @@ static void handle_button() {
 void setup() {
     Serial.begin(115200);
     delay(300);  // let USB CDC settle so the banner isn't lost
-    Serial.println("\n=== NBTV portable player ===");
+    Serial.println("\n=== NBTV portable player (radio) ===");
     Serial.printf("build: %s %s\n", __DATE__, __TIME__);
 
     button_init();
     settings_load(g_set);
-    Serial.printf("[cfg] ssid='%s' url='%s' token=%s speed=%.4f invert=%d\n",
+    Serial.printf("[cfg] ssid='%s' url='%s' token=%s\n"
+                  "[cfg] speed=%.4f gain=%.2f invert=%d\n",
                   g_set.wifi_ssid.c_str(), g_set.server_url.c_str(),
                   g_set.token.length() ? "set" : "none",
-                  g_set.speed, g_set.invert);
+                  g_set.speed, g_set.gain, g_set.invert);
 
     // Provision on first boot (no creds) or if the button is held at power-on.
     if (!settings_have_wifi(g_set) || button_down_now()) {
@@ -202,15 +192,13 @@ void setup() {
     for (int i = 0; i < (int)(sizeof(SPEED_PRESETS) / sizeof(SPEED_PRESETS[0])); ++i)
         if (fabsf(SPEED_PRESETS[i] - g_set.speed) < 0.005f) g_speed_idx = i;
 
-    nbtv_test_card(g_test);
-    fb_init();
-    bool codec_ok = audio_begin();  // fixed 48000 Hz; emit before WiFi is up
+    sb_init();
+    bool codec_ok = audio_begin();  // fixed 48000 Hz
     Serial.printf("[audio] codec init %s @ %d Hz; speed=%.4f (%.2f fps)\n",
                   codec_ok ? "OK" : "FAILED", NBTV_BASE_RATE, g_set.speed,
                   effective_fps());
-    Serial.println("[out] emitting test card; disc should lock now");
-    Serial.println("[tune] keys: +/- speed fine  ,/. speed coarse  "
-                   "[/] level  i invert  t testcard  p print");
+    Serial.println("[tune] keys: +/- speed fine  ,/. speed coarse  [/] level  "
+                   "i invert  p print");
 
     WiFi.setAutoReconnect(true);
     Serial.printf("[wifi] connecting to '%s'...\n", g_set.wifi_ssid.c_str());
@@ -219,9 +207,9 @@ void setup() {
         Serial.printf("[wifi] connected, IP=%s rssi=%d\n",
                       WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
     else
-        Serial.println("[wifi] NOT connected (will keep retrying; test card runs)");
+        Serial.println("[wifi] NOT connected (will keep retrying)");
     net_begin(g_set);
-    Serial.printf("[net] server=%s (long-poll + status started)\n",
+    Serial.printf("[net] server=%s (radio + long-poll + status)\n",
                   g_set.server_url.c_str());
 }
 
@@ -231,47 +219,23 @@ void loop() {
     handle_serial();
     handle_button();
 
-    const uint8_t *frame = g_test;
-    const char *state_name = "idle";
+    int filled = sb_count();
+    int buffer_ms = filled / (NBTV_BASE_RATE / 1000);   // 48 samples per ms
+    const char *state_name = filled > 0 ? "playing"
+                           : (net_stream_active() ? "buffering" : "nolink");
+    net_set_status(state_name, buffer_ms, g_underruns, g_set.speed);
 
-    if (g_state == ST_PLAYING) {
-        if (fb_pop(g_cur)) {
-            memcpy(g_last, g_cur, NBTV_FRAME_BYTES);
-            g_have_last = true;
-            g_frameseq++;
-            frame = g_cur;
-        } else {
-            g_underruns++;              // hold last frame; sync stays live
-            frame = g_have_last ? g_last : g_test;
-        }
-        state_name = (fb_count() > 0 || net_stream_active()) ? "playing"
-                                                             : "buffering";
-        // Stream finished and drained -> back to test card.
-        if (!net_stream_active() && fb_count() == 0) {
-            g_state = ST_IDLE;
-            Serial.println("[out] stream ended + drained -> test card");
-        }
-    } else if (g_state == ST_FROZEN) {
-        frame = g_have_last ? g_last : g_test;
-        state_name = "frozen";
-    }
-
-    int buffer_ms = (int)(fb_count() * (1000.0f / NBTV_BASE_FPS));
-    net_set_status(state_name, g_cur_id, g_frameseq, buffer_ms,
-                   g_underruns, g_set.speed);
-
-    // Throttled status line (~1 Hz) so it doesn't drown the 12.5 fps loop.
     static uint32_t last_log = 0;
     if (millis() - last_log >= 1000) {
         last_log = millis();
-        Serial.printf("[st] %-9s buf=%2d/%dms seq=%u under=%d spd=%.3f/%.2ffps "
-                      "gain=%.2f wifi=%d rssi=%d heap=%u\n",
-                      state_name, fb_count(), buffer_ms, (unsigned)g_frameseq,
-                      g_underruns, g_set.speed, effective_fps(), g_set.gain,
+        Serial.printf("[st] %-9s buf=%dms under=%d spd=%.4f/%.2ffps gain=%.2f "
+                      "inv=%d wifi=%d rssi=%d heap=%u\n",
+                      state_name, buffer_ms, g_underruns, g_set.speed,
+                      effective_fps(), g_set.gain, g_set.invert,
                       net_wifi_ok() ? 1 : 0,
                       net_wifi_ok() ? (int)WiFi.RSSI() : 0,
                       (unsigned)ESP.getFreeHeap());
     }
 
-    emit(frame);  // blocks ~1 frame; paces the whole loop to the disc clock
+    emit_block();  // blocks ~21 ms; paces the loop to the codec clock
 }

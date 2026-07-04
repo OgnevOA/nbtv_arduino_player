@@ -10,7 +10,7 @@ import logging
 
 from aiohttp import web
 
-from . import stream
+from . import render, stream
 from .bot import create_dispatcher
 from .config import settings
 from .control import Hub
@@ -20,10 +20,13 @@ log = logging.getLogger("nbtv")
 
 async def _run() -> None:
     settings.validate()
-    hub = Hub()
+    hub = Hub(default_speed=settings.default_speed)
 
     app = web.Application()
     app["hub"] = hub
+    # Pre-render the idle test-card PCM once (looped by the radio when idle).
+    app["testcard_pcm"] = render.test_card_pcm(
+        headroom=settings.default_headroom, lowpass_hz=settings.default_lowpass)
     stream.add_routes(app)
 
     runner = web.AppRunner(app)

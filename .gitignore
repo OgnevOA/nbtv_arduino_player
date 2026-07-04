@@ -8,6 +8,7 @@ firmware/.pio/
 # --- server ---
 server/data/
 **/*.nbtvf
+**/*.pcm
 .env
 
 # --- python ---
