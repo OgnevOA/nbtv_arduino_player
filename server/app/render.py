@@ -42,11 +42,15 @@ def _normalize_peak(x: np.ndarray, peak: int = 30000) -> np.ndarray:
 
 def frames_to_signal(frames: np.ndarray, *, flip_h: bool = False,
                      flip_v: bool = False, stabilize: bool = True,
-                     headroom: float = 0.80) -> np.ndarray:
+                     headroom: float = 0.80, gamma: float = 1.0) -> np.ndarray:
     """(n, ROWS, COLS) uint8 grey stack -> float32 NBTVA composite samples.
 
     Geometry (NBTVA): a "line" is a vertical column scanned bottom-to-top;
     successive lines step right-to-left; sync sits at the end of each line.
+
+    gamma compensates the lamp's non-linear brightness-vs-voltage curve
+    (brightness ~ signal^gamma); we pre-distort with the inverse so perceived
+    brightness tracks the picture. gamma > 1 brightens midtones; 1.0 = off.
     """
     img = frames.astype(np.float32)
     if flip_v:
@@ -60,6 +64,9 @@ def frames_to_signal(frames: np.ndarray, *, flip_h: bool = False,
         target = 0.5
         m = lum.mean(axis=(1, 2), keepdims=True)
         lum = np.clip(lum - m + target, 0.0, 1.0)
+
+    if gamma and gamma > 0 and gamma != 1.0:
+        lum = np.power(lum, 1.0 / gamma)          # LED brightness linearization
 
     white = nbtv.WHITE * float(headroom)          # picture ceiling
     active = nbtv.BLACK + lum * (white - nbtv.BLACK)
@@ -81,10 +88,11 @@ def signal_to_pcm(sig: np.ndarray, lowpass_hz: float = 10000.0) -> bytes:
 
 def frames_to_pcm(frames: np.ndarray, *, flip_h: bool = False,
                   flip_v: bool = False, stabilize: bool = True,
-                  headroom: float = 0.80, lowpass_hz: float = 10000.0) -> bytes:
+                  headroom: float = 0.80, gamma: float = 1.0,
+                  lowpass_hz: float = 10000.0) -> bytes:
     """Full frames -> mono s16le PCM bytes."""
     sig = frames_to_signal(frames, flip_h=flip_h, flip_v=flip_v,
-                           stabilize=stabilize, headroom=headroom)
+                           stabilize=stabilize, headroom=headroom, gamma=gamma)
     return signal_to_pcm(sig, lowpass_hz)
 
 
@@ -101,9 +109,9 @@ def test_card_frame() -> np.ndarray:
 
 
 def test_card_pcm(seconds: float = 1.0, headroom: float = 0.80,
-                  lowpass_hz: float = 10000.0) -> bytes:
+                  gamma: float = 1.0, lowpass_hz: float = 10000.0) -> bytes:
     """A short loopable test-card PCM buffer for the idle radio stream."""
     n = max(1, int(round(seconds * nbtv.BASE_FPS)))
     frames = np.repeat(test_card_frame()[None, :, :], n, axis=0)
     return frames_to_pcm(frames, stabilize=False, headroom=headroom,
-                         lowpass_hz=lowpass_hz)
+                         gamma=gamma, lowpass_hz=lowpass_hz)

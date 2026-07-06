@@ -30,6 +30,7 @@ HELP = (
     "/skip - play the queued item\n"
     "/loop on|off - loop the current item\n"
     "/speed 0.95 - set disc speed\n"
+    "/gamma 2.2 - set LED gamma (brightness curve)\n"
     "/invert - flip signal polarity\n"
     "/status - device + program status\n"
     "/test - show the test card"
@@ -49,6 +50,9 @@ def _controls(hub: Hub) -> InlineKeyboardMarkup:
          InlineKeyboardButton(text="- ", callback_data="spd:-0.001"),
          InlineKeyboardButton(text="+", callback_data="spd:+0.001"),
          InlineKeyboardButton(text="Faster ++", callback_data="spd:+0.005")],
+        [InlineKeyboardButton(text="gamma -", callback_data="gam:-0.1"),
+         InlineKeyboardButton(text=f"gamma {hub.gamma:g}", callback_data="status"),
+         InlineKeyboardButton(text="gamma +", callback_data="gam:+0.1")],
         [InlineKeyboardButton(text="Invert", callback_data="invert"),
          InlineKeyboardButton(text="Status", callback_data="status")],
     ])
@@ -63,13 +67,14 @@ def _allowed_cb(cb: CallbackQuery) -> bool:
 
 
 async def _encode_program(source: str, title: str, *, loop: bool,
-                          kind: str = "clip") -> Program:
+                          kind: str = "clip", gamma: float = 1.0) -> Program:
     """Encode (blocking) in a thread; reuse the .pcm cache when present.
 
     kind: "clip" (video), "still" (single image), "tgs" (animated sticker).
     """
     opt = encoder.EncodeOptions(max_height=settings.default_max_height,
                                 headroom=settings.default_headroom,
+                                led_gamma=gamma,
                                 lowpass=settings.default_lowpass)
     key = opt.cache_key(f"{kind}:{source}")
     out = settings.cache_dir / f"{key}.pcm"
@@ -138,6 +143,18 @@ def create_dispatcher(hub: Hub) -> tuple[Bot, Dispatcher]:
         hub.set_speed(value)
         await message.answer(f"speed set to {value:.4f}")
 
+    @dp.message(Command("gamma"))
+    async def cmd_gamma(message: Message, command: CommandObject):
+        if not _allowed(message):
+            return
+        try:
+            value = float((command.args or "").strip())
+        except ValueError:
+            await message.answer(f"usage: /gamma 2.2 (current {hub.gamma:g})")
+            return
+        new = hub.set_gamma(value)
+        await message.answer(f"gamma set to {new:g} (applies to new encodes)")
+
     @dp.message(Command("invert"))
     async def cmd_invert(message: Message):
         if not _allowed(message):
@@ -168,7 +185,7 @@ def create_dispatcher(hub: Hub) -> tuple[Bot, Dispatcher]:
             await bot.download(message.photo[-1], destination=local)
             await message.answer("encoding...")
             program = await _encode_program(str(local), "image", loop=True,
-                                            kind="still")
+                                            kind="still", gamma=hub.gamma)
         hub.play(program)
         await message.answer("displaying image", reply_markup=_controls(hub))
 
@@ -189,7 +206,7 @@ def create_dispatcher(hub: Hub) -> tuple[Bot, Dispatcher]:
             await bot.download(st, destination=local)
             await message.answer("encoding...")
             program = await _encode_program(str(local), label, loop=True,
-                                            kind=kind)
+                                            kind=kind, gamma=hub.gamma)
         hub.play(program)
         await message.answer(f"playing {label}", reply_markup=_controls(hub))
 
@@ -207,7 +224,8 @@ def create_dispatcher(hub: Hub) -> tuple[Bot, Dispatcher]:
             await bot.download(obj, destination=local)
             await message.answer("encoding...")
             program = await _encode_program(str(local), "upload", loop=True,
-                                            kind="still" if is_image else "clip")
+                                            kind="still" if is_image else "clip",
+                                            gamma=hub.gamma)
         hub.play(program)
         msg = "displaying image" if is_image else f"playing ({program.frames} frames)"
         await message.answer(msg, reply_markup=_controls(hub))
@@ -221,7 +239,7 @@ def create_dispatcher(hub: Hub) -> tuple[Bot, Dispatcher]:
             await message.answer("send a URL, video, or GIF (or /help)")
             return
         await message.answer("downloading + encoding...")
-        program = await _encode_program(text, text, loop=True)
+        program = await _encode_program(text, text, loop=True, gamma=hub.gamma)
         hub.play(program)
         await message.answer(f"playing ({program.frames} frames)",
                              reply_markup=_controls(hub))
@@ -256,6 +274,14 @@ def create_dispatcher(hub: Hub) -> tuple[Bot, Dispatcher]:
                 delta = 0.0
             new_speed = hub.adjust_speed(delta)
             toast = f"speed {new_speed:.4f}"
+        elif data.startswith("gam:"):
+            try:
+                delta = float(data[4:])
+            except ValueError:
+                delta = 0.0
+            new_gamma = hub.adjust_gamma(delta)
+            toast = f"gamma {new_gamma:g}"
+            refresh = True
         else:
             toast = "?"
 

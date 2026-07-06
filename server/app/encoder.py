@@ -30,10 +30,11 @@ class EncodeOptions:
     flip_v: bool = False
     stabilize: bool = True          # hold mean brightness per frame (AC-couple)
     headroom: float = 0.80          # picture-white ceiling (sync stays full)
+    led_gamma: float = 1.0          # lamp brightness linearization (1.0 = off)
     lowpass: float = 10000.0        # band-limit cutoff Hz (0 = off)
     contrast: float = 1.0
     brightness: float = 0.0
-    gamma: float = 1.0
+    gamma: float = 1.0              # source-side ffmpeg eq gamma (separate)
     start: str | None = None
     duration: str | None = None
     max_height: int = 360
@@ -42,8 +43,9 @@ class EncodeOptions:
         h = hashlib.sha1()
         h.update(source.encode())
         for v in (self.fit, self.flip_h, self.flip_v, self.stabilize,
-                  self.headroom, self.lowpass, self.contrast, self.brightness,
-                  self.gamma, self.start, self.duration, self.max_height):
+                  self.headroom, self.led_gamma, self.lowpass, self.contrast,
+                  self.brightness, self.gamma, self.start, self.duration,
+                  self.max_height):
             h.update(repr(v).encode())
         return h.hexdigest()[:16]
 
@@ -137,7 +139,7 @@ def encode_to_pcm(source: str, out_path: Path, opt: EncodeOptions,
     frames = _grey_frames(src, opt)
     pcm = render.frames_to_pcm(frames, flip_h=opt.flip_h, flip_v=opt.flip_v,
                                stabilize=opt.stabilize, headroom=opt.headroom,
-                               lowpass_hz=opt.lowpass)
+                               gamma=opt.led_gamma, lowpass_hz=opt.lowpass)
     _write_pcm(pcm, out_path)
     return int(frames.shape[0])
 
@@ -181,7 +183,7 @@ def encode_tgs_to_pcm(source: str, out_path: Path, opt: EncodeOptions,
     frames = _tgs_frames(src, opt, workdir)
     pcm = render.frames_to_pcm(frames, flip_h=opt.flip_h, flip_v=opt.flip_v,
                                stabilize=opt.stabilize, headroom=opt.headroom,
-                               lowpass_hz=opt.lowpass)
+                               gamma=opt.led_gamma, lowpass_hz=opt.lowpass)
     _write_pcm(pcm, out_path)
     return int(frames.shape[0])
 
@@ -196,6 +198,6 @@ def encode_still_to_pcm(source: str, out_path: Path, opt: EncodeOptions,
     # A still has no motion to stabilize; keep true picture levels.
     pcm = render.frames_to_pcm(stack, flip_h=opt.flip_h, flip_v=opt.flip_v,
                                stabilize=False, headroom=opt.headroom,
-                               lowpass_hz=opt.lowpass)
+                               gamma=opt.led_gamma, lowpass_hz=opt.lowpass)
     _write_pcm(pcm, out_path)
     return n

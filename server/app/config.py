@@ -29,6 +29,7 @@ class Settings:
     default_speed: float = float(os.environ.get("DEFAULT_SPEED", "0.95"))
     default_max_height: int = _int("DEFAULT_MAX_HEIGHT", 360)
     default_headroom: float = float(os.environ.get("DEFAULT_HEADROOM", "0.80"))
+    default_led_gamma: float = float(os.environ.get("DEFAULT_GAMMA", "2.2"))
     default_lowpass: float = float(os.environ.get("DEFAULT_LOWPASS", "10000"))
 
     def validate(self) -> None:

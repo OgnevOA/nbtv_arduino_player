@@ -59,7 +59,6 @@ async def handle_radio(request: web.Request) -> web.StreamResponse:
     if not _authed(request):
         raise web.HTTPForbidden()
     hub: Hub = request.app["hub"]
-    testcard: bytes = request.app["testcard_pcm"]
 
     resp = web.StreamResponse(
         headers={"Content-Type": "audio/wav", "Cache-Control": "no-store"},
@@ -74,7 +73,7 @@ async def handle_radio(request: web.Request) -> web.StreamResponse:
             if path is None or not path.exists():
                 # Idle: loop the test card until the program changes.
                 while hub.program_token == token:
-                    if not await _write_bytes(resp, testcard, hub, token):
+                    if not await _write_bytes(resp, hub.testcard, hub, token):
                         break
             else:
                 # Play the program's PCM, looping if requested.

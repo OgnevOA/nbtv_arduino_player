@@ -16,6 +16,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import render
+from .config import settings
+
 
 @dataclass
 class Program:
@@ -28,13 +31,15 @@ class Program:
 
 class Hub:
     def __init__(self, *, history: int = 64, offline_after: float = 8.0,
-                 default_speed: float = 0.95):
+                 default_speed: float = 0.95, default_gamma: float = 2.2):
         # device command channel (speed / invert / reboot)
         self._seq = 0
         self._commands: list[dict[str, Any]] = []
         self._history = history
         self._event = asyncio.Event()
         self.speed = default_speed          # server-side intent (for keyboard +/-)
+        self.gamma = default_gamma          # LED linearization baked into encodes
+        self.testcard: bytes = b""          # idle-stream PCM (regenerated on /gamma)
         # radio program channel
         self.program: Program | None = None      # None => idle (test card)
         self.nxt: Program | None = None
@@ -64,6 +69,24 @@ class Hub:
         """Nudge speed by delta (for the keyboard +/- buttons). Returns new speed."""
         self.set_speed(self.speed + delta)
         return self.speed
+
+    # --- LED gamma (server-side, baked into encodes) -----------------------
+    def render_testcard(self) -> None:
+        """(Re)build the idle test-card PCM at the current gamma."""
+        self.testcard = render.test_card_pcm(
+            headroom=settings.default_headroom, gamma=self.gamma,
+            lowpass_hz=settings.default_lowpass)
+
+    def set_gamma(self, value: float) -> float:
+        """Set LED gamma, refresh the idle test card, and bump the program token."""
+        self.gamma = round(max(0.5, min(4.0, value)), 3)
+        self.render_testcard()
+        self._bump_program()             # idle stream picks up the new test card
+        return self.gamma
+
+    def adjust_gamma(self, delta: float) -> float:
+        """Nudge gamma by delta (for the keyboard +/- buttons). Returns new gamma."""
+        return self.set_gamma(self.gamma + delta)
 
     def set_invert(self) -> int:
         return self._push(cmd="invert")
